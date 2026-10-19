@@ -1,1 +1,81 @@
+name: Corruption detection and auto-restore
 
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  integrity-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify file integrity
+        id: verify
+        shell: bash
+        run: |
+          set +e
+          sha256sum -c manifest.sha256 > /tmp/check.out 2>&1
+          status=$?
+          cat /tmp/check.out
+
+          if [ $status -ne 0 ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "files<<EOF" >> "$GITHUB_OUTPUT"
+            grep 'FAILED' /tmp/check.out | sed 's/: FAILED.*//' >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore corrupted files from backup branch
+        if: steps.verify.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -e
+          git fetch origin backup:backup
+          FILES=$(printf '%s\n' "${{ steps.verify.outputs.files }}" | sed '/^$/d')
+
+          if [ -z "$FILES" ]; then
+            echo "No file list captured; restoring all tracked files from backup branch."
+            git ls-tree -r --name-only backup | while read -r f; do
+              git checkout backup -- "$f"
+            done
+          else
+            echo "$FILES" | while read -r f; do
+              [ -n "$f" ] && git checkout backup -- "$f"
+            done
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "Nothing to restore."
+          else
+            git commit -m "Auto-restore corrupted files from backup branch"
+            git push origin HEAD:${GITHUB_REF_NAME}
+          fi
+
+      - name: Create issue when restore happens
+        if: steps.verify.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const files = `${{ steps.verify.outputs.files }}`.split('\n').filter(Boolean);
+            const body = files.length
+              ? `Corrupted files detected and restored automatically.\n\nFiles:\n${files.map(f => '- ' + f).join('\n')}`
+              : `Corrupted files detected and restored automatically. See workflow logs for details.`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Auto-restore: corrupted files detected',
+              body
+            });
